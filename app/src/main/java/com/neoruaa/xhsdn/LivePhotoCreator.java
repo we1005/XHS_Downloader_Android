@@ -9,10 +9,12 @@ import android.media.MediaScannerConnection;
 import android.util.Log;
 
 import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 
 public class LivePhotoCreator {
     private static final String TAG = "LivePhotoCreator";
@@ -45,15 +47,41 @@ public class LivePhotoCreator {
             
             // Read the video file size
             long videoSize = videoFile.length();
-            
+
             // For compatibility with working implementation, use video size for GCamera:MicroVideoOffset
             // Some parsers use fileLength - videoSize to locate video data
             String xmpDataStr = generateXMPMetadata((int)videoSize, (int)videoSize);
             byte[] xmpData = xmpDataStr.getBytes("UTF-8");
             byte[] xmpSegment = createXmpApp1Segment(xmpData);
-            
+
+            // Build a minimal EXIF App1 carrying the OPPO/ColorOS recognition stamp
+            // (UserComment = "oplus_8388608"). Empirically this is the single
+            // required signal for ColorOS 16 / OnePlus 15 to identify a third-party
+            // live photo; without it the file is treated as a static image even
+            // though the XMP MotionPhoto block is otherwise correct.
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(jpegFile.getAbsolutePath(), bounds);
+            byte[] exifSegment = createExifApp1Segment(
+                    Math.max(bounds.outWidth, 1),
+                    Math.max(bounds.outHeight, 1)
+            );
+
+            // Build the MPF (Multi-Picture Format) App2 segment. Together with
+            // the oplus_8388608 UserComment, this is the segment layout that
+            // matches what XHS's official app emits and what ColorOS 16
+            // recognizes. The MPImageLength entry is patched in-place after
+            // the JPEG portion is fully written.
+            long primaryJpegLength =
+                    2L                              // SOI
+                    + exifSegment.length
+                    + xmpSegment.length
+                    + 74L                           // MPF segment size (fixed)
+                    + (jpegFile.length() - 2L);     // rest of source JPEG after its own SOI
+            byte[] mpfSegment = createMpfApp2Segment((int) primaryJpegLength);
+
             // Create the live photo using streaming approach to avoid memory issues
-            boolean result = createLivePhotoStreaming(jpegFile, videoFile, outputFile, xmpSegment);
+            boolean result = createLivePhotoStreaming(jpegFile, videoFile, outputFile, exifSegment, xmpSegment, mpfSegment);
             
             // Clean up temporary JPEG file
             if (jpegFile.exists()) {
@@ -231,57 +259,167 @@ public class LivePhotoCreator {
 
     
     /**
-     * Generates XMP metadata for live photo
+     * Generates XMP metadata for live photo.
+     *
+     * This matches the byte pattern of the XMP that XHS's official app
+     * emits and that ColorOS 16 / OnePlus 15 recognizes as 实况照片:
+     *   - 4 namespaces only (no MiCamera, no MiCamera:XMPMeta blob)
+     *   - no GCamera:MicroVideo* legacy fields
+     *   - Primary container item carries only Mime + Semantic
+     *     (no Item:Length / Item:Padding)
+     *
      * @param videoSize The size of the embedded video in bytes
-     * @param videoLengthForOffset This parameter is actually the video size to be used for GCamera:MicroVideoOffset (some parsers use fileLength - videoSize to locate video)
+     * @param videoLengthForOffset Unused; kept for caller signature compatibility
      * @return XMP metadata string
      */
     private static String generateXMPMetadata(int videoSize, int videoLengthForOffset) {
         return String.format(
-            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core 5.1.0-jc003\">" +
-            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">" +
-            "<rdf:Description rdf:about=\"\"" +
-            "    xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\"" +
-            "    xmlns:OpCamera=\"http://ns.oplus.com/photos/1.0/camera/\"" +
-            "    xmlns:MiCamera=\"http://ns.xiaomi.com/photos/1.0/camera/\"" +
-            "    xmlns:Container=\"http://ns.google.com/photos/1.0/container/\"" +
-            "    xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\"" +
-            "  GCamera:MotionPhoto=\"1\"" +
-            "  GCamera:MotionPhotoVersion=\"1\"" +
-            "  GCamera:MotionPhotoPresentationTimestampUs=\"0\"" +
-            "  OpCamera:MotionPhotoPrimaryPresentationTimestampUs=\"0\"" +
-            "  OpCamera:MotionPhotoOwner=\"xhs\"" +
-            "  OpCamera:OLivePhotoVersion=\"2\"" +
-            "  OpCamera:VideoLength=\"%d\"" +
-            "  GCamera:MicroVideoVersion=\"1\"" +
-            "  GCamera:MicroVideo=\"1\"" +
-            "  GCamera:MicroVideoOffset=\"%d\"" +
-            "  GCamera:MicroVideoPresentationTimestampUs=\"0\"" +
-            "  MiCamera:XMPMeta=\"&lt;?xml version='1.0' encoding='UTF-8' standalone='yes' ?&gt;\">" +
-            "  <Container:Directory>" +
-            "    <rdf:Seq>" +
-            "      <rdf:li rdf:parseType=\"Resource\">" +
-            "        <Container:Item" +
-            "          Item:Mime=\"image/jpeg\"" +
-            "          Item:Semantic=\"Primary\"" +
-            "          Item:Length=\"0\"" +
-            "          Item:Padding=\"0\"/>" +
-            "      </rdf:li>" +
-            "      <rdf:li rdf:parseType=\"Resource\">" +
-            "        <Container:Item" +
-            "          Item:Mime=\"video/mp4\"" +
-            "          Item:Semantic=\"MotionPhoto\"" +
-            "          Item:Length=\"%d\"/>" +
-            "      </rdf:li>" +
-            "    </rdf:Seq>" +
-            "  </Container:Directory>" +
-            "</rdf:Description>" +
-            "</rdf:RDF>" +
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core 5.1.0-jc003\">\n" +
+            "  <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n" +
+            "    <rdf:Description rdf:about=\"\"\n" +
+            "        xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\"\n" +
+            "        xmlns:OpCamera=\"http://ns.oplus.com/photos/1.0/camera/\"\n" +
+            "        xmlns:Container=\"http://ns.google.com/photos/1.0/container/\"\n" +
+            "        xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\"\n" +
+            "      GCamera:MotionPhoto=\"1\"\n" +
+            "      GCamera:MotionPhotoVersion=\"1\"\n" +
+            "      GCamera:MotionPhotoPresentationTimestampUs=\"0\"\n" +
+            "      OpCamera:MotionPhotoPrimaryPresentationTimestampUs=\"0\"\n" +
+            "      OpCamera:MotionPhotoOwner=\"xhs\"\n" +
+            "      OpCamera:OLivePhotoVersion=\"2\"\n" +
+            "      OpCamera:VideoLength=\"%d\">\n" +
+            "      <Container:Directory>\n" +
+            "        <rdf:Seq>\n" +
+            "          <rdf:li rdf:parseType=\"Resource\">\n" +
+            "            <Container:Item\n" +
+            "              Item:Mime=\"image/jpeg\"\n" +
+            "              Item:Semantic=\"Primary\"/>\n" +
+            "          </rdf:li>\n" +
+            "          <rdf:li rdf:parseType=\"Resource\">\n" +
+            "            <Container:Item\n" +
+            "              Item:Mime=\"video/mp4\"\n" +
+            "              Item:Semantic=\"MotionPhoto\"\n" +
+            "              Item:Length=\"%d\"/>\n" +
+            "          </rdf:li>\n" +
+            "        </rdf:Seq>\n" +
+            "      </Container:Directory>\n" +
+            "    </rdf:Description>\n" +
+            "  </rdf:RDF>\n" +
             "</x:xmpmeta>",
-            videoSize, videoSize, videoSize  // All three use videoSize to match working implementation
+            videoSize, videoSize
         );
     }
     
+    /**
+     * Builds a minimal EXIF App1 segment carrying
+     * {@code ExifIFD.UserComment = "oplus_8388608"} (the recognition stamp
+     * ColorOS 16 / OnePlus 15 looks for on third-party live photos), plus
+     * placeholder IFD0 entries (ImageWidth/ImageHeight/Orientation).
+     *
+     * Layout (all big-endian):
+     *   FFE1 + segLen
+     *   "Exif\0\0"
+     *   TIFF header: "MM" 0x002A + IFD0_offset(8)
+     *   IFD0: 4 entries (Width, Height, Orientation=0, ExifIFDPointer) + next=0
+     *   ExifIFD: 2 entries (UserComment, LightSource=0) + next=0
+     *   Data area: UserComment payload (ASCII charset id + "oplus_8388608")
+     */
+    private static byte[] createExifApp1Segment(int width, int height) throws IOException {
+        byte[] userComment = "oplus_8388608".getBytes(StandardCharsets.US_ASCII);
+        byte[] charsetId = new byte[]{'A', 'S', 'C', 'I', 'I', 0, 0, 0};
+        byte[] ucBytes = new byte[charsetId.length + userComment.length];
+        System.arraycopy(charsetId, 0, ucBytes, 0, charsetId.length);
+        System.arraycopy(userComment, 0, ucBytes, charsetId.length, userComment.length);
+        int ucCount = ucBytes.length;
+
+        int ifd0Count = 4;
+        int ifd0Size = 2 + ifd0Count * 12 + 4;          // 54
+        int exifIfdOff = 8 + ifd0Size;                  // 62
+        int exifCount = 2;
+        int exifSize = 2 + exifCount * 12 + 4;          // 30
+        int ucDataOff = exifIfdOff + exifSize;          // 92
+
+        ByteArrayOutputStream tiff = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(tiff);
+        // TIFF header
+        dos.writeShort(0x4D4D);                         // "MM" big-endian
+        dos.writeShort(0x002A);                         // magic 42
+        dos.writeInt(8);                                // IFD0 offset
+
+        // IFD0
+        dos.writeShort(ifd0Count);
+        // ImageWidth (0x0100), LONG(4), count=1
+        dos.writeShort(0x0100); dos.writeShort(4); dos.writeInt(1); dos.writeInt(width);
+        // ImageHeight (0x0101), LONG(4), count=1
+        dos.writeShort(0x0101); dos.writeShort(4); dos.writeInt(1); dos.writeInt(height);
+        // Orientation (0x0112), SHORT(3), count=1, value packed into high 16 bits
+        dos.writeShort(0x0112); dos.writeShort(3); dos.writeInt(1); dos.writeInt(0);
+        // ExifIFDPointer (0x8769), LONG(4), count=1
+        dos.writeShort(0x8769); dos.writeShort(4); dos.writeInt(1); dos.writeInt(exifIfdOff);
+        dos.writeInt(0);                                // no IFD1
+
+        // ExifIFD
+        dos.writeShort(exifCount);
+        // UserComment (0x9286), UNDEFINED(7), count=ucCount, offset=ucDataOff
+        dos.writeShort(0x9286); dos.writeShort(7); dos.writeInt(ucCount); dos.writeInt(ucDataOff);
+        // LightSource (0x9208), SHORT(3), count=1, value=0
+        dos.writeShort(0x9208); dos.writeShort(3); dos.writeInt(1); dos.writeInt(0);
+        dos.writeInt(0);                                // next IFD
+
+        // Data area
+        dos.write(ucBytes);
+
+        byte[] tiffBytes = tiff.toByteArray();
+        int payloadLen = 6 + tiffBytes.length;          // "Exif\0\0" + TIFF
+        int segLen = payloadLen + 2;                    // includes the length field
+
+        ByteArrayOutputStream seg = new ByteArrayOutputStream();
+        seg.write(0xFF); seg.write(0xE1);
+        seg.write((segLen >> 8) & 0xFF); seg.write(segLen & 0xFF);
+        seg.write(new byte[]{'E', 'x', 'i', 'f', 0, 0});
+        seg.write(tiffBytes);
+        return seg.toByteArray();
+    }
+
+    /**
+     * Build a Multi-Picture Format App2 segment with NumberOfImages = 1.
+     * Layout matches the byte pattern observed in XHS's official app output.
+     *
+     * @param imageLength size of the primary JPEG (from SOI through EOI) in the
+     *                    final output file. Stored in the single MPEntry's
+     *                    image-size field.
+     */
+    private static byte[] createMpfApp2Segment(int imageLength) throws IOException {
+        int segLen = 72;                                    // includes the 2-byte length field
+        ByteArrayOutputStream tiff = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(tiff);
+        dos.write(new byte[]{'M', 'P', 'F', 0});            // signature
+        dos.writeShort(0x4D4D);                             // "MM" big-endian
+        dos.writeShort(0x002A);                             // TIFF magic
+        dos.writeInt(8);                                    // IFD0 offset
+        dos.writeShort(3);                                  // 3 IFD entries
+        // MPFVersion (0xB000), UNDEFINED(7), count=4, value inline "0100"
+        dos.writeShort(0xB000); dos.writeShort(7); dos.writeInt(4); dos.write(new byte[]{'0','1','0','0'});
+        // NumberOfImages (0xB001), LONG(4), count=1, value=1
+        dos.writeShort(0xB001); dos.writeShort(4); dos.writeInt(1); dos.writeInt(1);
+        // MPEntry (0xB002), UNDEFINED(7), count=16, offset=0x32
+        dos.writeShort(0xB002); dos.writeShort(7); dos.writeInt(16); dos.writeInt(0x32);
+        dos.writeInt(0);                                    // no IFD1
+        // MPEntry data (16 bytes)
+        dos.writeInt(0x00030000);                           // flags / image type
+        dos.writeInt(imageLength);                          // primary image size
+        dos.writeInt(0);                                    // offset = 0 (primary)
+        dos.writeShort(0); dos.writeShort(0);               // dep1, dep2
+
+        byte[] payload = tiff.toByteArray();
+
+        ByteArrayOutputStream seg = new ByteArrayOutputStream();
+        seg.write(0xFF); seg.write(0xE2);
+        seg.write((segLen >> 8) & 0xFF); seg.write(segLen & 0xFF);
+        seg.write(payload);
+        return seg.toByteArray();
+    }
+
     /**
      * Creates an APP1 XMP segment with proper JPEG header
      * @param xmpData The XMP data as bytes
@@ -350,10 +488,9 @@ public class LivePhotoCreator {
                 // Look for XMP signatures
                 boolean hasXmpMeta = content.contains("xmpmeta");
                 boolean hasMotionPhoto = content.contains("MotionPhoto");
-                boolean hasMicroVideo = content.contains("MicroVideo");
-                
-                Log.d(TAG, "XMP validation - xmpmeta: " + hasXmpMeta + ", MotionPhoto: " + hasMotionPhoto + ", MicroVideo: " + hasMicroVideo);
-                
+
+                Log.d(TAG, "XMP validation - xmpmeta: " + hasXmpMeta + ", MotionPhoto: " + hasMotionPhoto);
+
                 if (!hasXmpMeta || !hasMotionPhoto) {
                     Log.d(TAG, "File does not contain valid XMP Motion Photo metadata");
                     return false;
@@ -404,14 +541,16 @@ public class LivePhotoCreator {
      * @param imageFile The image file to use as the primary content
      * @param videoFile The video file to embed
      * @param outputFile The output live photo file
+     * @param exifSegment The EXIF App1 segment to insert (carries the ColorOS recognition stamp)
      * @param xmpSegment The XMP metadata segment to insert
+     * @param mpfSegment The MPF App2 segment (Multi-Picture Format, NumberOfImages=1)
      * @return True if successful, false otherwise
      */
-    private static boolean createLivePhotoStreaming(File imageFile, File videoFile, File outputFile, byte[] xmpSegment) {
+    private static boolean createLivePhotoStreaming(File imageFile, File videoFile, File outputFile, byte[] exifSegment, byte[] xmpSegment, byte[] mpfSegment) {
         try (FileInputStream imageStream = new FileInputStream(imageFile);
              FileInputStream videoStream = new FileInputStream(videoFile);
              FileOutputStream outputStream = new FileOutputStream(outputFile)) {
-            
+
             // Write the JPEG header (first 2 bytes: SOI marker - 0xFFD8)
             byte[] headerBuffer = new byte[2];
             int bytesRead = imageStream.read(headerBuffer);
@@ -420,9 +559,13 @@ public class LivePhotoCreator {
                 return false;
             }
             outputStream.write(headerBuffer);
-            
-            // Write the XMP segment right after SOI
+
+            // Segment order must be SOI -> EXIF -> XMP -> MPF -> rest. The
+            // EXIF UserComment="oplus_8388608" plus MPF declaration are what
+            // ColorOS 16 / OnePlus 15 uses to recognize the file as 实况照片.
+            outputStream.write(exifSegment);
             outputStream.write(xmpSegment);
+            outputStream.write(mpfSegment);
             
             // Skip the first 2 bytes of the image (already written) and copy the rest
             // Copy remaining image data
