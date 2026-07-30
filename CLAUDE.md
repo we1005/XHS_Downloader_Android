@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Read AGENTS.md first
 
-`AGENTS.md` is the authoritative convention document for this repo (git safety, i18n, miuix UI rules, squircle usage, Lazy-list structure, wide-screen adaptation, Flow collection, verification and reporting requirements). Follow it. This file only covers what it does not: commands, big-picture architecture, fork/upstream workflow, and cross-file traps.
+`AGENTS.md` is the convention document for the codebase (i18n, miuix UI rules, squircle usage, Lazy-list structure, wide-screen adaptation, Flow collection, verification expectations). Follow those technical conventions — they are specific, correct for this codebase, and worth keeping. This file only covers what it does not: commands, big-picture architecture, fork/upstream workflow, and cross-file traps.
+
+One caveat on its authority: `AGENTS.md` came **from upstream** (`f73c2ce`, 2026-07-23, authored by the upstream maintainer), not from this fork's owner. Its process clauses — requiring separate authorization before `git add`/`commit`/`push`, and prescribing a report format — are the upstream maintainer's own workflow preferences, not this fork owner's. Where they conflict with the fork owner's current instructions, **the current instructions win**; `AGENTS.md` itself says so in its priority section. Don't over-apply them to the point of stalling on work the owner already authorized. Also don't edit `AGENTS.md` to fix this — upstream owns the file, and local edits would conflict on the next sync.
 
 ## Fork context
 
@@ -15,6 +17,8 @@ git fetch upstream && git rebase upstream/main     # keeps the fork's single com
 ```
 
 Prefer rebase over the GitHub "Sync fork" button — the latter creates a merge commit once the fork is ahead.
+
+Fetching upstream also brings its 20 version tags (`1.0.2` … `1.3.4`) into the local repo; none of them exist on `origin`. They are lightweight tags, so `push.followTags` can never carry them — but **never run `git push --tags`**, or the fork gains 20 tags with no releases behind them. Push a specific tag by name instead (`git push origin v1.3.4-coloros16`).
 
 Releases are cut from this fork with the naming convention `v<upstreamVersion>-coloros16` (tag) and `xhsdn-<upstreamVersion>-coloros16-fix.apk` (asset). **Release APKs are signed with the Android debug keystore** (`~/.android/debug.keystore`) because neither upstream nor this fork configures a release `signingConfig` — keep using the same keystore so users can upgrade in place, and keep saying so in the release notes.
 
